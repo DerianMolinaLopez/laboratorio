@@ -1,0 +1,114 @@
+# DevSecOps: escaneos de seguridad y calidad en PRs y en cada ambiente.
+#
+#   gitleaks  -> secretos (passwords, tokens, llaves) en los commits
+#   trivy-fs  -> CVEs HIGH/CRITICAL en dependencias Maven + malas configuraciones (Dockerfile)
+#   sonarqube -> bugs, vulnerabilidades, code smells, cobertura (JaCoCo) + Quality Gate
+#
+# Las herramientas corren como contenedores dentro del dind (no se instalan en el job ni en tu PC).
+# El codigo se les pasa por stdin con tar, porque el workspace del job no es visible para el dind.
+name: security
+
+on:
+  push:
+    branches: [dev, QA, release, production]
+  pull_request:
+    branches: [dev, QA, release, production]
+    types: [opened, synchronize, reopened]
+
+env:
+  TRIVY_IMAGE: aquasec/trivy:0.76.2
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.30.1
+  MAVEN_IMAGE: maven:3.9-eclipse-temurin-17
+  JACOCO: org.jacoco:jacoco-maven-plugin:0.8.16
+  SONAR_PLUGIN: org.sonarsource.scanner.maven:sonar-maven-plugin:5.8.0.7211
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Buscar secretos en los commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          # En PRs solo se revisan los commits nuevos del PR; en push, todo el historial.
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            RANGE="origin/${{ github.base_ref }}..HEAD"
+          else
+            RANGE="--all"
+          fi
+          echo "Rango: $RANGE"
+          tar -cf - . | docker run --rm -i --network host -e RANGE="$RANGE" \
+            --entrypoint sh "$GITLEAKS_IMAGE" -c '
+              mkdir -p /tmp/src && tar -xf - -C /tmp/src &&
+              git config --global --add safe.directory /tmp/src &&
+              gitleaks git --no-banner --redact --verbose --log-opts="$RANGE" /tmp/src'
+
+  trivy-fs:
+    name: trivy-fs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolver dependencias Maven (cache local para Trivy)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Trivy lee el arbol de dependencias desde ~/.m2; si no estan, las pide una a una a
+          # Maven Central y este responde 429 (rate limit). Por eso las resuelve Maven primero.
+          tar -cf - pom.xml | docker run --rm -i --network host \
+            -v m2-cache-trivy:/root/.m2 "$MAVEN_IMAGE" sh -c '
+              mkdir -p /tmp/src && tar -xf - -C /tmp/src && cd /tmp/src &&
+              mvn -B -ntp -q dependency:resolve'
+
+      - name: Escanear dependencias y configuracion
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -cf - --exclude=.git . | docker run --rm -i --network host \
+            -v trivy-cache-fs:/root/.cache/trivy \
+            -v m2-cache-trivy:/root/.m2 \
+            --entrypoint sh "$TRIVY_IMAGE" -c '
+              mkdir -p /tmp/src && tar -xf - -C /tmp/src &&
+              trivy fs --scanners vuln,misconfig --offline-scan \
+                --severity HIGH,CRITICAL --ignore-unfixed \
+                --exit-code 1 /tmp/src'
+
+  sonarqube:
+    name: sonarqube
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Sonar usa el historial git para detectar el "codigo nuevo"
+      - name: Analisis + Quality Gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            SONAR_ARGS="-Dsonar.pullrequest.key=${{ github.event.pull_request.number }} -Dsonar.pullrequest.branch=${{ github.head_ref }} -Dsonar.pullrequest.base=${{ github.base_ref }}"
+          else
+            SONAR_ARGS="-Dsonar.branch.name=${GITHUB_REF_NAME}"
+          fi
+          echo "Sonar: $SONAR_ARGS"
+          tar -cf - . | docker run --rm -i --network host \
+            -v m2-cache:/root/.m2 \
+            -e SONAR_TOKEN -e SONAR_ARGS="$SONAR_ARGS" -e JACOCO -e SONAR_PLUGIN \
+            "$MAVEN_IMAGE" sh -c '
+              mkdir -p /tmp/src && tar -xf - -C /tmp/src && cd /tmp/src &&
+              git config --global --add safe.directory /tmp/src &&
+              mvn -B -ntp \
+                $JACOCO:prepare-agent verify $JACOCO:report \
+                $SONAR_PLUGIN:sonar \
+                -Dsonar.host.url=http://sonarqube:9000 \
+                -Dsonar.token=$SONAR_TOKEN \
+                -Dsonar.projectKey=productos-api \
+                -Dsonar.projectName=productos-api \
+                -Dsonar.qualitygate.wait=true \
+                -Dsonar.qualitygate.timeout=300 \
+                $SONAR_ARGS'
+          echo "### SonarQube: http://localhost:9000/dashboard?id=productos-api" >> "$GITHUB_STEP_SUMMARY"

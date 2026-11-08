@@ -1,0 +1,7 @@
+.git
+.gitea
+.github
+target
+.idea
+.vscode
+*.iml

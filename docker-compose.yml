@@ -1,0 +1,189 @@
+# Mini home lab CI/CD: Gitea + Gitea Actions (act_runner) + Docker Registry
+#
+# Todo queda aislado en este proyecto de compose ("homelab-cicd"):
+#   - Los builds se ejecutan en un Docker-in-Docker (dind) propio, NO en el Docker de tu maquina.
+#     Las imagenes, capas y contenedores de los jobs viven dentro del volumen dind-data.
+#   - Los datos usan volumenes con nombre (no carpetas de OneDrive).
+#   - `docker compose down -v` borra absolutamente todo.
+
+name: homelab-cicd
+
+services:
+  # --------------------------------------------------------------------------
+  # Servidor Git + Actions
+  # --------------------------------------------------------------------------
+  gitea:
+    image: gitea/gitea:${GITEA_VERSION:-1}
+    container_name: cicd-gitea
+    restart: unless-stopped
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__server__DOMAIN: localhost
+      GITEA__server__ROOT_URL: http://localhost:${GITEA_HTTP_PORT:-3000}/
+      GITEA__server__HTTP_PORT: "3000"
+      GITEA__server__SSH_DOMAIN: localhost
+      GITEA__server__SSH_PORT: ${GITEA_SSH_PORT:-2222}
+      GITEA__server__SSH_LISTEN_PORT: "22"
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__actions__ENABLED: "true"
+      GITEA__actions__DEFAULT_ACTIONS_URL: github
+      GITEA__repository__DEFAULT_BRANCH: main
+    ports:
+      - "${GITEA_HTTP_PORT:-3000}:3000"
+      - "${GITEA_SSH_PORT:-2222}:22"
+    volumes:
+      - gitea-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks: [cicd]
+
+  # --------------------------------------------------------------------------
+  # Docker-in-Docker: motor donde corren los jobs y los `docker build`.
+  # Comparte la red de gitea (network_mode service:gitea) para que, dentro de
+  # los jobs, http://localhost:3000 (ROOT_URL) apunte a Gitea y el checkout funcione.
+  # Su API queda en tcp://gitea:2375, solo accesible dentro de la red interna.
+  # --------------------------------------------------------------------------
+  dind:
+    image: docker:${DIND_VERSION:-27}-dind
+    container_name: cicd-dind
+    restart: unless-stopped
+    privileged: true
+    network_mode: "service:gitea"
+    depends_on:
+      - gitea
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    command:
+      - --host=tcp://0.0.0.0:2375
+      - --host=unix:///var/run/docker.sock
+      - --tls=false
+      - --insecure-registry=registry:5000
+    volumes:
+      - dind-data:/var/lib/docker
+
+  # --------------------------------------------------------------------------
+  # Runner de Gitea Actions (equivalente a un self-hosted runner de GitHub)
+  # --------------------------------------------------------------------------
+  runner:
+    image: gitea/act_runner:${RUNNER_VERSION:-latest}
+    container_name: cicd-runner
+    restart: unless-stopped
+    depends_on:
+      gitea:
+        condition: service_healthy
+      dind:
+        condition: service_started
+    environment:
+      CONFIG_FILE: /config.yaml
+      GITEA_INSTANCE_URL: http://gitea:3000
+      GITEA_RUNNER_REGISTRATION_TOKEN: ${RUNNER_TOKEN:-}   # lo genera bootstrap.ps1
+      GITEA_RUNNER_NAME: homelab-runner
+      DOCKER_HOST: tcp://gitea:2375
+    volumes:
+      - ./runner/config.yaml:/config.yaml:ro
+      - runner-data:/data
+    networks: [cicd]
+
+  # --------------------------------------------------------------------------
+  # Container Registry privado + UI web
+  # --------------------------------------------------------------------------
+  registry:
+    image: registry:2
+    container_name: cicd-registry
+    restart: unless-stopped
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      REGISTRY_HTTP_HEADERS_Access-Control-Allow-Origin: "['*']"
+    ports:
+      - "${REGISTRY_PORT:-5000}:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+    networks: [cicd]
+
+  registry-ui:
+    image: joxit/docker-registry-ui:main
+    container_name: cicd-registry-ui
+    restart: unless-stopped
+    depends_on:
+      - registry
+    environment:
+      SINGLE_REGISTRY: "true"
+      REGISTRY_TITLE: Home Lab Registry
+      NGINX_PROXY_PASS_URL: http://registry:5000
+      DELETE_IMAGES: "true"
+      SHOW_CONTENT_DIGEST: "true"
+      SHOW_CATALOG_NB_TAGS: "true"
+      CATALOG_ELEMENTS_LIMIT: "1000"
+    ports:
+      - "${REGISTRY_UI_PORT:-5080}:80"
+    networks: [cicd]
+
+  # --------------------------------------------------------------------------
+  # SonarQube (calidad + SAST) con el plugin de ramas/PRs de la comunidad
+  # --------------------------------------------------------------------------
+  sonar-db:
+    image: postgres:${SONAR_DB_VERSION:-17-alpine}
+    container_name: cicd-sonar-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sonar
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: ${SONAR_DB_PASSWORD:-sonar}
+    volumes:
+      - sonar-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonar -d sonar"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [cicd]
+
+  sonarqube:
+    image: mc1arke/sonarqube-with-community-branch-plugin:${SONARQUBE_VERSION:-26.5.0.122743-community}
+    container_name: cicd-sonarqube
+    restart: unless-stopped
+    depends_on:
+      sonar-db:
+        condition: service_healthy
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://sonar-db:5432/sonar
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: ${SONAR_DB_PASSWORD:-sonar}
+      # Evita tener que subir vm.max_map_count en el kernel de WSL (Elasticsearch embebido)
+      SONAR_SEARCH_JAVAADDITIONALOPTS: -Dnode.store.allow_mmap=false
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+      SONAR_TELEMETRY_ENABLE: "false"
+    ports:
+      - "${SONAR_PORT:-9000}:9000"
+    volumes:
+      - sonar-data:/opt/sonarqube/data
+      - sonar-extensions:/opt/sonarqube/extensions
+      - sonar-logs:/opt/sonarqube/logs
+    healthcheck:
+      # la imagen no trae curl/wget: peticion HTTP con bash puro
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9000 && printf 'GET /api/system/status HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '\"status\":\"UP\"' <&3"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+    networks: [cicd]
+
+networks:
+  cicd:
+    name: homelab-cicd
+
+volumes:
+  gitea-data:
+  dind-data:
+  runner-data:
+  registry-data:
+  sonar-db-data:
+  sonar-data:
+  sonar-extensions:
+  sonar-logs:

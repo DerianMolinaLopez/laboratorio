@@ -1,0 +1,99 @@
+# Build + push de imagen Docker al registry del home lab.
+#
+#   Evento                          Tags publicados en registry:5000/productos-api
+#   ------------------------------  ----------------------------------------------------------
+#   PR hacia dev/QA/release/prod.   pr-<N>, pr-<N>-<sha>
+#   push a dev                      dev-<version>-<sha>, dev-latest
+#   push a QA                       qa-<version>-<sha>, qa-latest
+#   push a release                  release-<version>-<sha>, release-latest, rc-<version>
+#   push a production               production-<version>-<sha>, production-latest, <version>, latest
+name: docker-build
+
+on:
+  push:
+    branches: [dev, QA, release, production]
+  pull_request:
+    branches: [dev, QA, release, production]
+    types: [opened, synchronize, reopened]
+
+env:
+  REGISTRY: registry:5000
+  IMAGE_NAME: productos-api
+
+jobs:
+  build-and-push:
+    name: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Calcular version y tags
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(awk '/<artifactId>productos-api<\/artifactId>/{f=1} f && /<version>/{gsub(/.*<version>|<\/version>.*/,""); print; exit}' pom.xml)
+          SHA="${GITHUB_SHA::7}"
+          IMG="${REGISTRY}/${IMAGE_NAME}"
+
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            PR="${{ github.event.pull_request.number }}"
+            TAGS="pr-${PR} pr-${PR}-${SHA}"
+            TARGET="${{ github.base_ref }}"
+          else
+            TARGET="${GITHUB_REF_NAME}"
+            ENV=$(echo "$TARGET" | tr '[:upper:]' '[:lower:]')
+            TAGS="${ENV}-${VERSION}-${SHA} ${ENV}-latest"
+            case "$ENV" in
+              release)    TAGS="$TAGS rc-${VERSION}" ;;
+              production) TAGS="$TAGS ${VERSION} latest" ;;
+            esac
+          fi
+
+          REFS=""
+          for t in $TAGS; do REFS="$REFS ${IMG}:${t}"; done
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}"         >> "$GITHUB_OUTPUT"
+          echo "refs=${REFS# }"     >> "$GITHUB_OUTPUT"
+          echo "Evento: ${GITHUB_EVENT_NAME} -> ${TARGET} | version ${VERSION}"
+          echo "Imagenes:${REFS}"
+
+      - name: Docker build (incluye mvn package + tests)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker version --format 'Docker engine: {{.Server.Version}}'
+          TAG_ARGS=""
+          for r in ${{ steps.meta.outputs.refs }}; do TAG_ARGS="$TAG_ARGS -t $r"; done
+          docker build $TAG_ARGS \
+            --build-arg APP_VERSION=${{ steps.meta.outputs.version }} \
+            --build-arg GIT_SHA=${{ steps.meta.outputs.sha }} \
+            --label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }} \
+            .
+
+      - name: Escaneo de la imagen con Trivy (bloquea el push si hay HIGH/CRITICAL)
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -- ${{ steps.meta.outputs.refs }}
+          docker run --rm --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v trivy-cache-image:/root/.cache/trivy \
+            aquasec/trivy:0.76.2 image \
+              --scanners vuln,secret \
+              --severity HIGH,CRITICAL --ignore-unfixed \
+              --exit-code 1 "$1"
+
+      - name: Push al registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          for r in ${{ steps.meta.outputs.refs }}; do docker push "$r"; done
+          {
+            echo "### Imagenes publicadas"
+            for r in ${{ steps.meta.outputs.refs }}; do
+              echo "- \`${r/registry:5000/localhost:5000}\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

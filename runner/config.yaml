@@ -1,0 +1,32 @@
+# Configuracion de act_runner (https://docs.gitea.com/usage/actions/act-runner)
+log:
+  level: info
+
+runner:
+  file: /data/.runner          # registro del runner (persistido en el volumen runner-data)
+  capacity: 2                  # jobs en paralelo
+  timeout: 1h
+  fetch_timeout: 5s
+  fetch_interval: 2s
+  envs:
+    # Los jobs corren en la red de gitea/dind, asi que el daemon de Docker esta en localhost.
+    DOCKER_HOST: tcp://localhost:2375
+  labels:
+    # runs-on: ubuntu-latest  -> imagen con node (para las actions) y docker CLI
+    - "ubuntu-latest:docker://catthehacker/ubuntu:act-22.04"
+    - "ubuntu-22.04:docker://catthehacker/ubuntu:act-22.04"
+
+cache:
+  enabled: false
+
+container:
+  # "host" = red del dind, que a su vez es la red de gitea:
+  #   localhost:3000 -> Gitea, registry:5000 -> Registry
+  network: host
+  privileged: false
+  options:
+  workdir_parent:
+  valid_volumes: []
+  # "-" = no montar el socket de Docker en los jobs; usan DOCKER_HOST (arriba)
+  docker_host: "-"
+  force_pull: false

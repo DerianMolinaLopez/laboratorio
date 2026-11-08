@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cicd-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dev
+  labels:
+    homelab/environment: dev
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: qa
+  labels:
+    homelab/environment: qa
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: release
+  labels:
+    homelab/environment: release
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    homelab/environment: production

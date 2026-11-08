@@ -1,0 +1,45 @@
+# Cluster Kubernetes del home lab (k3s dentro de contenedores Docker, via k3d)
+#
+#   k3d cluster create --config k3d/cluster.yaml     (lo hace bootstrap.ps1)
+#   k3d cluster delete homelab                        (borra el cluster, no toca el resto del lab)
+#
+# Los nodos se conectan a la red "homelab-cicd" del docker compose, asi que:
+#   - los pods descargan imagenes de registry:5000 (el registry del lab)
+#   - los jobs de Gitea Actions llegan al API en https://k3d-homelab-serverlb:6443
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: homelab
+servers: 1
+agents: 2
+image: rancher/k3s:v1.36.6-k3s1
+network: homelab-cicd
+
+kubeAPI:
+  hostIP: "127.0.0.1"   # el API solo se publica en tu maquina, no en la LAN
+  hostPort: "6550"
+
+ports:
+  # Ingress (Traefik, incluido en k3s): http://productos-<ambiente>.localhost:8081
+  - port: 8081:80
+    nodeFilters:
+      - loadbalancer
+
+registries:
+  # El registry del lab es HTTP (sin TLS): se declara como mirror inseguro en containerd
+  config: |
+    mirrors:
+      "registry:5000":
+        endpoint:
+          - http://registry:5000
+
+options:
+  k3s:
+    extraArgs:
+      # Certificado del API valido tambien para el nombre interno que usan los pipelines
+      - arg: --tls-san=k3d-homelab-serverlb
+        nodeFilters:
+          - server:*
+  kubeconfig:
+    updateDefaultKubeconfig: true   # agrega el contexto "k3d-homelab" a ~/.kube/config
+    switchCurrentContext: false     # no cambia el contexto que tengas activo

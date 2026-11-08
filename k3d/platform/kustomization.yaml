@@ -1,0 +1,10 @@
+# Recursos de plataforma (los administra el lab, no la app):
+#   - un namespace por ambiente
+#   - la ServiceAccount con la que Gitea Actions despliega (solo puede tocar esos namespaces)
+#
+#   kubectl --context k3d-homelab apply -k k3d/platform
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespaces.yaml
+  - deployer.yaml

@@ -1,0 +1,13 @@
+# Manifiestos comunes a todos los ambientes. Cada overlay (k8s/overlays/<ambiente>) define
+# namespace, replicas, host del Ingress y el tag de la imagen.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+labels:
+  - pairs:
+      app.kubernetes.io/name: productos-api
+      app.kubernetes.io/part-of: homelab
+    includeSelectors: true
+resources:
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml

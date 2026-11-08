@@ -24,6 +24,8 @@ jobs:
   build-and-push:
     name: build-and-push
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}   # tag inmutable <ambiente>-<version>-<sha> que usa el deploy
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,6 +56,8 @@ jobs:
           REFS=""
           for t in $TAGS; do REFS="$REFS ${IMG}:${t}"; done
 
+          set -- $TAGS
+          echo "tag=$1"             >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "sha=${SHA}"         >> "$GITHUB_OUTPUT"
           echo "refs=${REFS# }"     >> "$GITHUB_OUTPUT"
@@ -97,3 +101,88 @@ jobs:
               echo "- \`${r/registry:5000/localhost:5000}\`"
             done
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # Deploy al cluster k3d: solo en push/merge a una rama de ambiente (no en PRs).
+  #   dev -> namespace dev | QA -> qa | release -> release | production -> production
+  # Si el rollout o el smoke test fallan, vuelve a la version anterior y el job queda en rojo.
+  # --------------------------------------------------------------------------
+  deploy:
+    name: deploy
+    needs: build-and-push
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      KUBECTL_VERSION: v1.36.6
+      LB: k3d-homelab-serverlb   # load balancer de k3d: API en :6443 e Ingress en :80
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preparar kubectl
+        shell: bash
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KUBECONFIG_B64" ]; then
+            echo "::error::Falta el secreto KUBECONFIG en el repo. Ejecuta bootstrap.ps1 para crearlo."
+            exit 1
+          fi
+          ARCH=$(dpkg --print-architecture)   # amd64 o arm64
+          curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          mkdir -p ~/.kube
+          echo "$KUBECONFIG_B64" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+          kubectl version
+
+      - name: Aplicar manifiestos
+        id: apply
+        shell: bash
+        run: |
+          set -euo pipefail
+          NS=$(echo "${GITHUB_REF_NAME}" | tr '[:upper:]' '[:lower:]')
+          TAG="${{ needs.build-and-push.outputs.tag }}"
+          echo "ns=${NS}" >> "$GITHUB_OUTPUT"
+          cd "k8s/overlays/${NS}"
+          sed -i "s|newTag: .*|newTag: ${TAG}|" kustomization.yaml
+          kubectl apply -k .
+          kubectl -n "$NS" annotate deployment/productos-api --overwrite \
+            kubernetes.io/change-cause="${GITHUB_REF_NAME} ${TAG} (${GITHUB_SHA::7})"
+
+      - name: Esperar el rollout
+        shell: bash
+        run: kubectl -n "${{ steps.apply.outputs.ns }}" rollout status deployment/productos-api --timeout=180s
+
+      - name: Smoke test por el Ingress
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST="productos-${{ steps.apply.outputs.ns }}.localhost"
+          for i in $(seq 1 10); do
+            if curl -fsS -H "Host: ${HOST}" "http://${LB}/api/productos"; then echo; exit 0; fi
+            sleep 3
+          done
+          echo "::error::El smoke test fallo: GET http://${HOST}/api/productos"
+          exit 1
+
+      - name: Rollback si algo fallo
+        if: failure() && steps.apply.outcome == 'success'
+        shell: bash
+        run: |
+          NS="${{ steps.apply.outputs.ns }}"
+          kubectl -n "$NS" rollout undo deployment/productos-api || true
+          kubectl -n "$NS" rollout status deployment/productos-api --timeout=180s || true
+          echo "### :rewind: Deploy fallido en ${NS}: se restauro la version anterior" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resumen
+        shell: bash
+        run: |
+          NS="${{ steps.apply.outputs.ns }}"
+          {
+            echo "### :rocket: Desplegado en \`${NS}\`"
+            echo "- Imagen: \`registry:5000/productos-api:${{ needs.build-and-push.outputs.tag }}\`"
+            echo "- URL: http://productos-${NS}.localhost:8081/api/productos"
+          } >> "$GITHUB_STEP_SUMMARY"
+          kubectl -n "$NS" get pods -o wide

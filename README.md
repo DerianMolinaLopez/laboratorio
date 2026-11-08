@@ -9,6 +9,10 @@ Flujo DevOps local, todo en Docker y aislado de tu entorno:
                                                                  │ trivy image (bloquea si HIGH/CRITICAL)
                                                                  ▼
                                                      Registry (:5000) ◄── Registry UI (:5080)
+                                                                 │ deploy (solo en push/merge a una rama de ambiente)
+                                                                 ▼
+                                           k3d "homelab" (k3s) ── ns dev · qa · release · production
+                                                                 └─► http://productos-<ambiente>.localhost:8081
 ```
 
 | Servicio      | URL                                   | Para qué                                   |
@@ -18,6 +22,8 @@ Flujo DevOps local, todo en Docker y aislado de tu entorno:
 | Registry UI   | http://localhost:5080                 | Ver/borrar imágenes y tags                 |
 | Registry API  | http://localhost:5000/v2/_catalog     | `docker pull localhost:5000/...`           |
 | Git por SSH   | `ssh://git@localhost:2222/...`        | Opcional                                   |
+| App en k8s    | http://productos-dev.localhost:8081/api/productos | Una URL por ambiente (`dev`, `qa`, `release`, `production`) |
+| Kubernetes API| `kubectl --context k3d-homelab ...`   | Solo en `127.0.0.1:6550`                   |
 
 ## Por qué no afecta tu máquina
 
@@ -116,6 +122,48 @@ git push gitea feature/hola
 Luego abre un PR `feature/hola -> dev` en Gitea: se construye `pr-<N>`. Al hacer merge se construye
 `dev-...`. Promoción: PR `dev -> QA`, `QA -> release`, `release -> production`.
 
+## Kubernetes (k3d)
+
+El cluster `homelab` es **k3s corriendo en contenedores Docker** (vía [k3d](https://k3d.io)): 1 server
+y 2 agents conectados a la red `homelab-cicd`, así que descargan imágenes de `registry:5000` y los
+pipelines llegan a su API. Funciona igual en Windows (Docker Desktop) y en Linux (Docker Engine).
+
+| Archivo | Qué hace |
+|---|---|
+| `k3d/cluster.yaml` | Definición del cluster: versión de k3s, nodos, puertos, registry inseguro |
+| `k3d/platform/` | Namespaces `dev`, `qa`, `release`, `production` + ServiceAccount `gitea-deployer` (rol `edit` solo en esos namespaces) |
+| `templates/k8s/base/` | Deployment, Service e Ingress de la app (no root, FS de solo lectura, probes, límites) |
+| `templates/k8s/overlays/<ambiente>/` | Namespace, réplicas (1 en dev/qa, 2 en release/production), host del Ingress y tag de imagen |
+
+Flujo del job **deploy** (en `docker-build.yml`, después de `build-and-push`, solo en push/merge):
+
+1. Aplica `k8s/overlays/<ambiente>` con la imagen recién publicada (`<ambiente>-<version>-<sha>`).
+2. Espera el rollout (máx. 3 min).
+3. Smoke test: `GET /api/productos` a través del Ingress.
+4. Si falla el rollout o el smoke test: `kubectl rollout undo` y el job queda en rojo.
+
+El bootstrap guarda en Gitea el secreto `KUBECONFIG` con el token de `gitea-deployer`: el pipeline
+no usa el admin del cluster.
+
+```powershell
+kubectl --context k3d-homelab get pods -A                       # todo el cluster
+kubectl --context k3d-homelab -n dev rollout history deploy/productos-api   # historial de deploys
+k3d cluster stop homelab                                         # apagar (conserva estado)
+k3d cluster start homelab                                        # encender
+k3d cluster delete homelab                                       # borrar solo el cluster
+```
+
+### Instalar k3d y kubectl
+
+- **Windows**: `winget install k3d.k3d` (kubectl ya viene con Docker Desktop).
+- **Linux**:
+  ```bash
+  curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.9.0 bash
+  curl -LO "https://dl.k8s.io/release/v1.36.6/bin/linux/$(dpkg --print-architecture)/kubectl" && sudo install kubectl /usr/local/bin/
+  ```
+
+Para levantar el lab sin cluster: `bootstrap.ps1 -SkipK8s`.
+
 ## Usar las imágenes
 
 ```powershell
@@ -132,6 +180,7 @@ docker compose ps                     # estado
 docker compose logs -f runner         # logs del runner
 docker compose stop                   # apagar (conserva datos)
 docker compose up -d                  # encender de nuevo
+k3d cluster delete homelab            # (antes de down -v: el cluster usa la red del compose)
 docker compose down -v; Remove-Item -Recurse -Force .\workspace, .\.env   # borrar TODO
 ```
 
@@ -141,8 +190,13 @@ docker compose down -v; Remove-Item -Recurse -Force .\workspace, .\.env   # borr
 cicd/
 ├── docker-compose.yml        # gitea, dind, runner, registry, registry-ui
 ├── runner/config.yaml        # config de act_runner (labels, red, DOCKER_HOST)
+├── k3d/
+│   ├── cluster.yaml          # cluster k3s "homelab" (nodos, puertos, registry)
+│   └── platform/             # namespaces por ambiente + ServiceAccount del pipeline
 ├── templates/                # lo que se agrega al repo de la app
 │   ├── Dockerfile
+│   ├── k8s/base/             # Deployment, Service, Ingress
+│   ├── k8s/overlays/         # dev, qa, release, production
 │   ├── .dockerignore
 │   ├── .gitattributes
 │   └── .gitea/

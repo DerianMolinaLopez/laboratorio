@@ -1,0 +1,74 @@
+# Identidad de los pipelines dentro del cluster.
+# Tiene el rol "edit" (crear/actualizar Deployments, Services, Ingress...) SOLO en los
+# namespaces de ambiente. No puede ver otros namespaces ni cambiar permisos (RBAC).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitea-deployer
+  namespace: cicd-system
+---
+# Token de larga duracion para el kubeconfig que bootstrap.ps1 guarda como secreto KUBECONFIG en Gitea
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gitea-deployer-token
+  namespace: cicd-system
+  annotations:
+    kubernetes.io/service-account.name: gitea-deployer
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitea-deployer-edit
+  namespace: dev
+subjects:
+  - kind: ServiceAccount
+    name: gitea-deployer
+    namespace: cicd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitea-deployer-edit
+  namespace: qa
+subjects:
+  - kind: ServiceAccount
+    name: gitea-deployer
+    namespace: cicd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitea-deployer-edit
+  namespace: release
+subjects:
+  - kind: ServiceAccount
+    name: gitea-deployer
+    namespace: cicd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitea-deployer-edit
+  namespace: production
+subjects:
+  - kind: ServiceAccount
+    name: gitea-deployer
+    namespace: cicd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit

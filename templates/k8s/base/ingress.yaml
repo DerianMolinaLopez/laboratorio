@@ -1,0 +1,18 @@
+# Traefik (incluido en k3s). El host lo define cada overlay: productos-<ambiente>.localhost
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: productos-api
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: productos.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: productos-api
+                port:
+                  name: http

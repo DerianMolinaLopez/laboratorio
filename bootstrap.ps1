@@ -6,13 +6,15 @@
     4. Genera el token del runner y levanta act_runner
     5. Crea el repo en Gitea e importa el proyecto de origen (copia en .\workspace,
        tu repo original NO se modifica) con Dockerfile + workflow
-    6. Crea las ramas dev, QA, release, production y hace push (dispara los builds)
+    6. Crea el cluster Kubernetes (k3d) y guarda su kubeconfig como secreto KUBECONFIG del repo
+    7. Crea las ramas dev, QA, release, production y hace push (dispara los builds)
 
   Uso:   powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1
   Es idempotente: se puede volver a ejecutar sin romper nada.
 #>
 param(
-  [switch]$SkipImport   # solo infraestructura, sin importar el proyecto
+  [switch]$SkipImport,  # solo infraestructura, sin importar el proyecto
+  [switch]$SkipK8s      # sin cluster k3d (no habra deploy)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -164,6 +166,60 @@ Invoke-RestMethod -Method Put -Uri "$GiteaUrl/api/v1/repos/$owner/$repo/actions/
 Write-Host 'Secreto SONAR_TOKEN configurado en el repo.'
 
 # ---------------------------------------------------------------------------
+if (-not $SkipK8s) {
+  Step 'Cluster Kubernetes (k3d): homelab'
+  foreach ($tool in 'k3d', 'kubectl') {
+    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+      throw "Falta $tool. Windows: winget install k3d.k3d / kubectl viene con Docker Desktop. Linux: ver README (seccion Kubernetes)."
+    }
+  }
+  $clusters = @(k3d cluster list -o json | ConvertFrom-Json)
+  if (-not ($clusters | Where-Object { $_.name -eq 'homelab' })) {
+    k3d cluster create --config (Join-Path $PSScriptRoot 'k3d\cluster.yaml')
+    Check-Exit 'k3d cluster create'
+  } else {
+    k3d cluster start homelab   # por si estaba detenido; si ya corre no hace nada
+    Check-Exit 'k3d cluster start'
+  }
+  $kc = @('--context', 'k3d-homelab')
+  kubectl @kc apply -k (Join-Path $PSScriptRoot 'k3d\platform')
+  Check-Exit 'kubectl apply k3d/platform'
+
+  # Kubeconfig de la ServiceAccount gitea-deployer (solo puede desplegar en dev/qa/release/production)
+  $deadline = (Get-Date).AddMinutes(1)
+  do {
+    Start-Sleep -Seconds 2
+    $saToken = kubectl @kc -n cicd-system get secret gitea-deployer-token -o 'jsonpath={.data.token}'
+  } until ($saToken -or (Get-Date) -gt $deadline)
+  if (-not $saToken) { throw 'Kubernetes no genero el token de gitea-deployer' }
+  $caData = kubectl @kc -n cicd-system get secret gitea-deployer-token -o 'jsonpath={.data.ca\.crt}'
+  $saToken = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($saToken))
+  $kubeconfig = @"
+apiVersion: v1
+kind: Config
+clusters:
+  - name: homelab
+    cluster:
+      server: https://k3d-homelab-serverlb:6443
+      certificate-authority-data: $caData
+users:
+  - name: gitea-deployer
+    user:
+      token: $saToken
+contexts:
+  - name: homelab
+    context:
+      cluster: homelab
+      user: gitea-deployer
+current-context: homelab
+"@
+  $kubeconfigB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($kubeconfig))
+  Invoke-RestMethod -Method Put -Uri "$GiteaUrl/api/v1/repos/$owner/$repo/actions/secrets/KUBECONFIG" -Headers $headers `
+    -ContentType 'application/json' -Body (@{ data = $kubeconfigB64 } | ConvertTo-Json) | Out-Null
+  Write-Host 'Secreto KUBECONFIG configurado en el repo.'
+}
+
+# ---------------------------------------------------------------------------
 Step 'Preparando copia de trabajo en .\workspace (tu repo original no se toca)'
 $ws = Join-Path $PSScriptRoot "workspace\$repo"
 if (-not (Test-Path $ws)) {
@@ -178,6 +234,7 @@ Copy-Item (Join-Path $PSScriptRoot 'templates\Dockerfile')     $ws -Force
 Copy-Item (Join-Path $PSScriptRoot 'templates\.dockerignore')  $ws -Force
 Copy-Item (Join-Path $PSScriptRoot 'templates\.gitattributes') $ws -Force
 Copy-Item (Join-Path $PSScriptRoot 'templates\.gitea') $ws -Recurse -Force   # workflows + scripts
+Copy-Item (Join-Path $PSScriptRoot 'templates\k8s') $ws -Recurse -Force     # manifiestos (kustomize)
 
 git -C $ws add -A
 git -C $ws diff --cached --quiet
@@ -247,4 +304,8 @@ Write-Host "Actions        : $GiteaUrl/$owner/$repo/actions"
 Write-Host "SonarQube      : $SonarUrl   (usuario admin, password SONAR_ADMIN_PASSWORD en .env)"
 Write-Host "Registry UI    : http://localhost:$($cfg.REGISTRY_UI_PORT)"
 Write-Host "Registry API   : http://localhost:$($cfg.REGISTRY_PORT)/v2/_catalog"
+if (-not $SkipK8s) {
+  Write-Host "Kubernetes     : kubectl --context k3d-homelab get pods -A"
+  Write-Host "App por ambiente: http://productos-<dev|qa|release|production>.localhost:8081/api/productos"
+}
 Write-Host "Copia de trabajo: $ws"

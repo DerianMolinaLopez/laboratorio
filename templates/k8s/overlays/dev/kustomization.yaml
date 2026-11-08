@@ -1,0 +1,25 @@
+# Ambiente: dev  ->  namespace dev, http://productos-dev.localhost:8081
+# El pipeline (deploy) reemplaza newTag por la imagen recien publicada: dev-<version>-<sha>
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: dev
+resources:
+  - ../../base
+labels:
+  - pairs:
+      app.kubernetes.io/instance: productos-api-dev
+images:
+  - name: productos-api
+    newName: registry:5000/productos-api
+    newTag: dev-latest
+replicas:
+  - name: productos-api
+    count: 1
+patches:
+  - target:
+      kind: Ingress
+      name: productos-api
+    patch: |
+      - op: replace
+        path: /spec/rules/0/host
+        value: productos-dev.localhost
